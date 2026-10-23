@@ -132,6 +132,7 @@ class CoreTests(unittest.TestCase):
     def test_search_and_sources(self):
         self.assertTrue(needs_search("What is the latest NATA exam date?"))
         self.assertFalse(needs_search("What does an architect do?"))
+        self.assertFalse(needs_search("Which college course gives the best jobs and salary?"))
         self.assertNotIn("student@example.com", search_query("Fees for student@example.com in Pune"))
         self.assertIsNone(safe_source("http://localhost/private"))
         self.assertIsNone(safe_source("https://[::1]/private"))

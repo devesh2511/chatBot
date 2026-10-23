@@ -1,0 +1,9 @@
+[project]
+name = "career-chatbot"
+version = "0.1.0"
+description = "Personalised career chat backend"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

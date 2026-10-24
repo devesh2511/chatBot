@@ -94,31 +94,22 @@ class MemoryCache:
         self._lock = threading.Lock()
 
     def get(self, key: str) -> dict | None:
+        """Return the profile and renew its expiry, like Upstash GETEX."""
         with self._lock:
             entry = self._profiles.get(key)
+            now = time.monotonic()
             if entry is None:
                 return None
             value, expires_at = entry
-            if expires_at <= time.monotonic():
+            if expires_at <= now:
                 del self._profiles[key]
                 return None
+            self._profiles[key] = (value, now + self.PROFILE_TTL)
             return value
 
     def put(self, key: str, value: dict) -> None:
         with self._lock:
             self._profiles[key] = (value, time.monotonic() + self.PROFILE_TTL)
-
-    def renew(self, key: str) -> bool:
-        with self._lock:
-            entry = self._profiles.get(key)
-            now = time.monotonic()
-            if entry is None:
-                return False
-            if entry[1] <= now:
-                del self._profiles[key]
-                return False
-            self._profiles[key] = (entry[0], now + self.PROFILE_TTL)
-            return True
 
     def rate(self, key: str) -> int:
         with self._lock:
@@ -139,20 +130,34 @@ class UpstashCache:
         self.url = url.rstrip("/")
         self.token = token
 
-    def command(self, *parts) -> object:
+    def _post(self, url: str, body: list) -> object:
         try:
-            response = json_request(self.url, method="POST",
-                                    headers={"Authorization": f"Bearer {self.token}",
-                                             "Content-Type": "application/json"},
-                                    body=list(parts), timeout=5)
+            return json_request(url, method="POST",
+                                headers={"Authorization": f"Bearer {self.token}",
+                                         "Content-Type": "application/json"},
+                                body=body, timeout=5)
         except (HTTPError, ChatError) as error:
             raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.") from error
+
+    @staticmethod
+    def _result(response: object) -> object:
         if not isinstance(response, dict) or response.get("error"):
             raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
         return response.get("result")
 
+    def command(self, *parts) -> object:
+        return self._result(self._post(self.url, list(parts)))
+
+    def pipeline(self, *commands: list) -> list:
+        """Run several commands in one HTTP round trip."""
+        responses = self._post(self.url + "/pipeline", list(commands))
+        if not isinstance(responses, list) or len(responses) != len(commands):
+            raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
+        return [self._result(response) for response in responses]
+
     def get(self, key: str) -> dict | None:
-        value = self.command("GET", key)
+        """Return the profile and renew its expiry in the same call."""
+        value = self.command("GETEX", key, "EX", 86400)
         if value is None:
             return None
         try:
@@ -166,14 +171,9 @@ class UpstashCache:
     def put(self, key: str, value: dict) -> None:
         self.command("SET", key, json.dumps(value, ensure_ascii=False), "EX", 86400)
 
-    def renew(self, key: str) -> bool:
-        return self.command("EXPIRE", key, 86400) == 1
-
     def rate(self, key: str) -> int:
-        count = int(self.command("INCR", key))
-        if count == 1:
-            self.command("EXPIRE", key, 120)
-        return count
+        count, _ = self.pipeline(["INCR", key], ["EXPIRE", key, 120, "NX"])
+        return int(count)
 
 
 class BraveSearch:

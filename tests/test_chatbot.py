@@ -55,9 +55,6 @@ class FakeCache:
     def put(self, key, value):
         self.values[key] = value
 
-    def renew(self, key):
-        return key in self.values
-
     def rate(self, key):
         self.counts[key] = self.counts.get(key, 0) + 1
         return self.counts[key]
@@ -183,7 +180,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(cache.rate("rate"), 1)
             self.assertEqual(cache.rate("rate"), 2)
         with patch("chatbot.integrations.time.monotonic", return_value=200):
-            self.assertTrue(cache.renew("profile"))
+            self.assertEqual(cache.get("profile"), {"name": "Other"})
         with patch("chatbot.integrations.time.monotonic", return_value=220):
             self.assertEqual(cache.rate("rate"), 1)
         with patch("chatbot.integrations.time.monotonic", return_value=86601):

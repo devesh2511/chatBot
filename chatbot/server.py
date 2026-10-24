@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .core import (ChatError, context_key, get_session_cookie, needs_search,
+from .core import (ChatError, context_key, daily_key, get_session_cookie, needs_search,
                    normalize_context, rate_key, system_prompt, validate_message)
 from .integrations import BraveSearch, CareerApi, MemoryCache, UpstashCache
 from .providers import HostedProvider
@@ -21,6 +21,7 @@ from .providers import HostedProvider
 LOG = logging.getLogger("chatbot")
 NO_CURRENT_FACTS = ("I couldn't verify current information right now. Please check an official "
                     "college, exam, or government source and try again later.")
+DAILY_LIMIT = 25
 
 
 @dataclass(frozen=True)
@@ -112,31 +113,26 @@ class ChatService:
     def prepare(self, cookie: str, body: object, timings: dict | None = None):
         timings = {} if timings is None else timings
         _, message, history = validate_message(body)
-        # The rate limit and both careerAPI checks need only the cookie, so run them
-        # together. Results are read in a fixed order to keep 429 > 401 > 402 precedence.
+        # The snapshot is frozen per login session: only the first message of a session
+        # calls careerAPI (/me, /me/access, userContext). Later messages, in any chat,
+        # reuse it until it expires.
+        key = context_key(self.config.hmac_secret, cookie)
         rate = self._pool.submit(self._timed, timings, "rate", self.cache.rate,
                                  rate_key(self.config.hmac_secret, cookie, time.time()))
-        me = self._pool.submit(self._timed, timings, "me", self.career_api.student, cookie)
-        access = self._pool.submit(self._timed, timings, "access",
-                                   self.career_api.check_access, cookie)
+        cached = self._pool.submit(self._timed, timings, "cache_get", self.cache.get, key)
         if rate.result() > 20:
             raise ChatError(429, "rate_limited", "Too many messages. Please wait a minute.")
-        student = me.result()
-        access.result()
-        # One snapshot per student. A new chat (no history) refreshes it from careerAPI;
-        # open chats pick up the refreshed profile on their next message. Reading the
-        # snapshot also renews its expiry.
-        key = context_key(self.config.hmac_secret, student["id"])
-        record = self._timed(timings, "cache_get", self.cache.get, key) if history else None
-        if record is None:
-            context = normalize_context(self._timed(timings, "user_context",
-                                                    self.career_api.context_by_email,
-                                                    student["email"]))
-            record = {"context": context, "created_at": time.time()}
-            self._timed(timings, "cache_put", self.cache.put, key, record)
-        context = record.get("context") if isinstance(record, dict) else None
-        if not isinstance(context, dict):
-            raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
+        record = cached.result()
+        if not (isinstance(record, dict) and isinstance(record.get("context"), dict)
+                and isinstance(record.get("student_id"), str)):
+            record = self._load_session(cookie, key, timings)
+        context = record["context"]
+        usage_key = daily_key(self.config.hmac_secret, record["student_id"], time.time())
+        used = self._timed(timings, "daily", self.cache.usage, usage_key)
+        # Checked before search and the model, which both spend quota.
+        if used >= DAILY_LIMIT:
+            raise ChatError(429, "daily_limit_reached",
+                            f"You've used all {DAILY_LIMIT} messages for today. Please come back tomorrow.")
         search_used = needs_search(message)
         evidence = []
         if search_used:
@@ -152,7 +148,34 @@ class ChatService:
                                prompt, history, message)
         sources = [{"title": item["title"], "url": item["url"], "date": item["date"]}
                    for item in evidence]
-        return self.provider.chunks(response), sources, search_used
+        return self._counted(self.provider.chunks(response), usage_key), sources, search_used
+
+    def _load_session(self, cookie: str, key: str, timings: dict) -> dict:
+        me = self._pool.submit(self._timed, timings, "me", self.career_api.student, cookie)
+        access = self._pool.submit(self._timed, timings, "access",
+                                   self.career_api.check_access, cookie)
+        # Read in a fixed order to keep 401 ahead of 402.
+        student = me.result()
+        access.result()
+        context = normalize_context(self._timed(timings, "user_context",
+                                                self.career_api.context_by_email,
+                                                student["email"]))
+        record = {"student_id": student["id"], "context": context, "created_at": time.time()}
+        self._timed(timings, "cache_put", self.cache.put, key, record)
+        return record
+
+    def _counted(self, chunks, usage_key: str):
+        """Yield the reply, then count it toward the daily cap.
+
+        Only a fully streamed reply is counted: a provider error or client disconnect
+        stops the generator before the increment. The canned no-facts reply is not
+        wrapped because it never reaches the model."""
+        yield from chunks
+        try:
+            self.cache.add_usage(usage_key)
+        except ChatError:
+            # The student already has the full answer; don't turn it into a stream error.
+            LOG.warning("daily usage increment failed")
 
 
 def json_response(status: int, body: dict):

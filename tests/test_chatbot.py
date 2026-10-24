@@ -1,6 +1,7 @@
 import io
 import json
 import threading
+import time
 import unittest
 import uuid
 from http.client import HTTPConnection
@@ -8,7 +9,7 @@ from http.server import ThreadingHTTPServer
 from dataclasses import replace
 from unittest.mock import patch
 
-from chatbot.core import (ChatError, context_key, get_session_cookie, needs_search,
+from chatbot.core import (ChatError, context_key, daily_key, get_session_cookie, needs_search,
                           normalize_context, safe_source, search_query, validate_message)
 from chatbot.providers import HostedProvider
 from chatbot.server import ChatService, Config, make_handler
@@ -18,12 +19,14 @@ from chatbot.verify_context import summarize
 
 class FakeCareerApi:
     def __init__(self):
+        self.me_calls = 0
         self.context_calls = 0
         self.access_calls = 0
         self.access = True
         self.city = "Pune"
 
     def student(self, cookie):
+        self.me_calls += 1
         return {"id": f"id-{cookie}", "email": f"{cookie}@example.com"}
 
     def context(self, cookie):
@@ -58,6 +61,12 @@ class FakeCache:
     def rate(self, key):
         self.counts[key] = self.counts.get(key, 0) + 1
         return self.counts[key]
+
+    def usage(self, key):
+        return self.counts.get(key, 0)
+
+    def add_usage(self, key):
+        self.counts[key] = self.counts.get(key, 0) + 1
 
 
 class FakeSearch:
@@ -183,8 +192,14 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(cache.get("profile"), {"name": "Other"})
         with patch("chatbot.integrations.time.monotonic", return_value=220):
             self.assertEqual(cache.rate("rate"), 1)
+            self.assertEqual(cache.usage("daily"), 0)
+            cache.add_usage("daily")
+            cache.add_usage("daily")
+            self.assertEqual(cache.usage("daily"), 2)
         with patch("chatbot.integrations.time.monotonic", return_value=86601):
             self.assertIsNone(cache.get("profile"))
+        with patch("chatbot.integrations.time.monotonic", return_value=220 + 172800):
+            self.assertEqual(cache.usage("daily"), 0)
 
     def test_external_contract_clients(self):
         seen = []
@@ -260,20 +275,24 @@ class ServiceTests(unittest.TestCase):
         chunks, sources, searched = self.request()
         self.assertEqual(list(chunks), ["A useful answer."])
         self.assertFalse(searched)
-        self.assertEqual(self.api.context_calls, 1)
         self.request(message="How do I prepare?", history=self.HISTORY)
-        self.assertEqual(self.api.context_calls, 1)
-        self.assertEqual(self.api.access_calls, 2)
+        # Only the session's first message calls careerAPI.
+        self.assertEqual((self.api.me_calls, self.api.access_calls, self.api.context_calls),
+                         (1, 1, 1))
 
-    def test_one_snapshot_per_student_refreshed_by_new_chats(self):
+    def test_snapshot_is_frozen_for_the_session_across_new_chats(self):
         self.request()
         self.api.city = "Mumbai"
         self.cid = str(uuid.uuid4())
         self.request()
-        self.assertEqual(self.api.context_calls, 2)
-        self.assertEqual(len(self.cache.values), 1)
         self.request(message="Follow-up", history=self.HISTORY)
-        self.assertEqual(self.api.context_calls, 2)
+        self.assertEqual((self.api.me_calls, self.api.access_calls, self.api.context_calls),
+                         (1, 1, 1))
+        self.assertEqual(len(self.cache.values), 1)
+        self.assertIn("Pune", self.provider.calls[-1][0])
+        self.assertNotIn("Mumbai", self.provider.calls[-1][0])
+        # A new login session takes a fresh snapshot.
+        self.request(cookie="session-a2")
         self.assertIn("Mumbai", self.provider.calls[-1][0])
 
     def test_search_sources_and_no_verification_fallback(self):
@@ -287,15 +306,47 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("couldn't verify", next(chunks))
         self.assertEqual(self.provider.calls, [])
 
-    def test_eviction_and_lost_access(self):
+    def test_access_is_checked_once_per_session_snapshot(self):
         self.request()
         self.api.access = False
+        self.request(message="Follow-up", history=self.HISTORY)
         with self.assertRaisesRegex(ChatError, "active plan"):
-            self.request(message="Follow-up")
+            self.request(cookie="session-b")
+        # After the snapshot expires or is evicted, the next message checks again.
+        self.cache.values.pop(context_key(config().hmac_secret, "session-a"))
+        with self.assertRaisesRegex(ChatError, "active plan"):
+            self.request(message="Follow-up", history=self.HISTORY)
         self.api.access = True
-        self.cache.values.pop(context_key(config().hmac_secret, "id-session-a"))
         self.request(message="Follow-up", history=self.HISTORY)
         self.assertEqual(self.api.context_calls, 2)
+
+    def test_daily_cap_counts_only_completed_model_replies(self):
+        usage_key = daily_key(config().hmac_secret, "id-session-a", time.time())
+        self.cache.rate = lambda key: 1  # keep the per-minute limit out of the way
+        # Unconsumed (cancelled) replies and the canned no-facts reply are not counted.
+        self.request()
+        self.search.results = []
+        self.assertIn("couldn't verify", next(self.request("Latest NATA exam date?")[0]))
+        self.assertEqual(self.cache.counts.get(usage_key, 0), 0)
+        for _ in range(25):
+            self.assertEqual(list(self.request()[0]), ["A useful answer."])
+        self.assertEqual(self.cache.counts[usage_key], 25)
+        calls = len(self.provider.calls)
+        with self.assertRaises(ChatError) as caught:
+            self.request()
+        self.assertEqual((caught.exception.status, caught.exception.code), (429, "daily_limit_reached"))
+        self.assertEqual(len(self.provider.calls), calls)
+        # The cap is per student, and a new IST day starts a fresh count.
+        self.assertEqual(list(self.request(cookie="session-b")[0]), ["A useful answer."])
+        with patch("chatbot.server.time.time", return_value=time.time() + 86400):
+            self.assertEqual(list(self.request()[0]), ["A useful answer."])
+
+    def test_daily_key_rolls_over_at_ist_midnight(self):
+        secret = config().hmac_secret
+        before = daily_key(secret, "7", 1792866599)  # 2026-10-24 23:59:59 IST
+        after = daily_key(secret, "7", 1792866600)   # 2026-10-25 00:00:00 IST
+        self.assertNotEqual(before, after)
+        self.assertEqual(before, daily_key(secret, "7", 1792780200))  # 2026-10-24 00:00:00 IST
 
     def test_users_and_conversations_are_isolated(self):
         self.request(cookie="session-a")
@@ -317,8 +368,7 @@ class ServiceTests(unittest.TestCase):
                               {"role": "assistant", "content": "A useful answer."}]
         request["message"] = "How should I prepare?"
         self.assertEqual(list(service.prepare("session-a", request)[0]), ["A useful answer."])
-        self.assertEqual(api.context_calls, 1)
-        self.assertEqual(api.access_calls, 2)
+        self.assertEqual((api.me_calls, api.access_calls, api.context_calls), (1, 1, 1))
         provider.calls.clear()
         request["message"] = "What is the latest exam date?"
         chunks, sources, searched = service.prepare("session-a", request)

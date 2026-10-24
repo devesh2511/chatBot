@@ -87,24 +87,23 @@ class MemoryCache:
 
     PROFILE_TTL = 86400
     RATE_TTL = 120
+    USAGE_TTL = 172800
 
     def __init__(self):
         self._profiles = {}
         self._rates = {}
+        self._usage = {}
         self._lock = threading.Lock()
 
     def get(self, key: str) -> dict | None:
-        """Return the profile and renew its expiry, like Upstash GETEX."""
         with self._lock:
             entry = self._profiles.get(key)
-            now = time.monotonic()
             if entry is None:
                 return None
             value, expires_at = entry
-            if expires_at <= now:
+            if expires_at <= time.monotonic():
                 del self._profiles[key]
                 return None
-            self._profiles[key] = (value, now + self.PROFILE_TTL)
             return value
 
     def put(self, key: str, value: dict) -> None:
@@ -123,6 +122,22 @@ class MemoryCache:
             if len(self._rates) > 1000:
                 self._rates = {k: v for k, v in self._rates.items() if v[1] > now}
             return count
+
+    def usage(self, key: str) -> int:
+        with self._lock:
+            count, expires_at = self._usage.get(key, (0, 0))
+            return count if expires_at > time.monotonic() else 0
+
+    def add_usage(self, key: str) -> None:
+        with self._lock:
+            now = time.monotonic()
+            count, expires_at = self._usage.get(key, (0, 0))
+            if expires_at <= now:
+                count, expires_at = 0, now + self.USAGE_TTL
+            self._usage[key] = (count + 1, expires_at)
+            # Daily keys rotate at midnight; drop finished days as they accumulate.
+            if len(self._usage) > 1000:
+                self._usage = {k: v for k, v in self._usage.items() if v[1] > now}
 
 
 class UpstashCache:
@@ -156,8 +171,8 @@ class UpstashCache:
         return [self._result(response) for response in responses]
 
     def get(self, key: str) -> dict | None:
-        """Return the profile and renew its expiry in the same call."""
-        value = self.command("GETEX", key, "EX", 86400)
+        # Plain GET: the expiry is fixed from the session's first message, not renewed.
+        value = self.command("GET", key)
         if value is None:
             return None
         try:
@@ -174,6 +189,13 @@ class UpstashCache:
     def rate(self, key: str) -> int:
         count, _ = self.pipeline(["INCR", key], ["EXPIRE", key, 120, "NX"])
         return int(count)
+
+    def usage(self, key: str) -> int:
+        return int(self.command("GET", key) or 0)
+
+    def add_usage(self, key: str) -> None:
+        # Two days, so a key first written just before midnight outlives its own day.
+        self.pipeline(["INCR", key], ["EXPIRE", key, 172800, "NX"])
 
 
 class BraveSearch:

@@ -51,16 +51,22 @@ class CareerApi:
             raise ChatError(502, "invalid_context", "careerAPI returned invalid data.")
         return result
 
-    def context(self, cookie: str) -> dict:
+    def student(self, cookie: str) -> dict:
+        """The logged-in student's id and email, from GET /me."""
         student = self._get("me", cookie=cookie).get("student")
-        email = student.get("email") if isinstance(student, dict) else None
-        if not isinstance(email, str) or not email.strip():
+        student = student if isinstance(student, dict) else {}
+        email = student.get("email")
+        if student.get("id") is None or not isinstance(email, str) or not email.strip():
             raise ChatError(502, "invalid_student", "Could not identify your account.")
+        return {"id": str(student["id"]), "email": email}
+
+    def context(self, cookie: str) -> dict:
+        email = self.student(cookie)["email"]
         self.check_access(cookie)
         return self.context_by_email(email)
 
     def context_by_email(self, email: str) -> dict:
-        """Service-only lookup; the public chat path must use context(cookie)."""
+        """Service-only lookup; pass only an email that came from the caller's own /me."""
         if not isinstance(email, str) or not email.strip():
             raise ChatError(400, "invalid_email", "An email is required for this check.")
         path = "userContext?" + urlencode({"email": email.strip()})
@@ -98,14 +104,9 @@ class MemoryCache:
                 return None
             return value
 
-    def put_first(self, key: str, value: dict) -> bool:
+    def put(self, key: str, value: dict) -> None:
         with self._lock:
-            now = time.monotonic()
-            entry = self._profiles.get(key)
-            if entry is not None and entry[1] > now:
-                return False
-            self._profiles[key] = (value, now + self.PROFILE_TTL)
-            return True
+            self._profiles[key] = (value, time.monotonic() + self.PROFILE_TTL)
 
     def renew(self, key: str) -> bool:
         with self._lock:
@@ -162,8 +163,8 @@ class UpstashCache:
             pass
         raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
 
-    def put_first(self, key: str, value: dict) -> bool:
-        return self.command("SET", key, json.dumps(value, ensure_ascii=False), "NX", "EX", 86400) == "OK"
+    def put(self, key: str, value: dict) -> None:
+        self.command("SET", key, json.dumps(value, ensure_ascii=False), "EX", 86400)
 
     def renew(self, key: str) -> bool:
         return self.command("EXPIRE", key, 86400) == 1

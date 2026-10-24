@@ -21,12 +21,19 @@ class FakeCareerApi:
         self.context_calls = 0
         self.access_calls = 0
         self.access = True
+        self.city = "Pune"
+
+    def student(self, cookie):
+        return {"id": f"id-{cookie}", "email": f"{cookie}@example.com"}
 
     def context(self, cookie):
+        return self.context_by_email(self.student(cookie)["email"])
+
+    def context_by_email(self, email):
         self.context_calls += 1
         return {"student": {"full_name": "Ananya Sharma", "email": "private@example.com",
                             "current_career": "Architect"},
-                "profile": {"class": 10, "city": "Pune", "hobbies": ["Drawing"]},
+                "profile": {"class": 10, "city": self.city, "hobbies": ["Drawing"]},
                 "latest_quiz": {"riasec_code": "AIC", "results": {
                     "stream_recommendation": "PCM", "top_careers": [
                         {"title": "Architect", "match_pct": 91, "email": "hidden@example.com"}]}}}
@@ -45,11 +52,8 @@ class FakeCache:
     def get(self, key):
         return self.values.get(key)
 
-    def put_first(self, key, value):
-        if key in self.values:
-            return False
+    def put(self, key, value):
         self.values[key] = value
-        return True
 
     def renew(self, key):
         return key in self.values
@@ -173,8 +177,9 @@ class CoreTests(unittest.TestCase):
 
         cache = MemoryCache()
         with patch("chatbot.integrations.time.monotonic", return_value=100):
-            self.assertTrue(cache.put_first("profile", {"name": "Asha"}))
-            self.assertFalse(cache.put_first("profile", {"name": "Other"}))
+            cache.put("profile", {"name": "Asha"})
+            cache.put("profile", {"name": "Other"})
+            self.assertEqual(cache.get("profile"), {"name": "Other"})
             self.assertEqual(cache.rate("rate"), 1)
             self.assertEqual(cache.rate("rate"), 2)
         with patch("chatbot.integrations.time.monotonic", return_value=200):
@@ -191,7 +196,7 @@ class CoreTests(unittest.TestCase):
             if url.endswith("me/access"):
                 return {"has_access": True}
             if url.endswith("/me"):
-                return {"student": {"email": "student@example.com"}}
+                return {"student": {"id": 7, "email": "student@example.com"}}
             if "userContext?email=" in url:
                 return {"email": "student@example.com", "profile": {"class": 10}}
             if url == "https://redis.example":
@@ -202,21 +207,23 @@ class CoreTests(unittest.TestCase):
         with patch("chatbot.integrations.json_request", side_effect=fake_request):
             api = CareerApi("https://api.example/", "service-token")
             self.assertEqual(api.context("token")["profile"]["class"], 10)
+            self.assertEqual(api.student("token"), {"id": "7", "email": "student@example.com"})
             api.check_access("token")
-            self.assertTrue(UpstashCache("https://redis.example", "secret").put_first("key", {"profile": {}}))
+            UpstashCache("https://redis.example", "secret").put("key", {"profile": {}})
             self.assertEqual(BraveSearch("key").search("Latest exam date?")[0]["date"], "2026-10-23")
         self.assertIn("Cookie", seen[0][1]["headers"])
         self.assertNotIn("Authorization", seen[0][1]["headers"])
         self.assertIn("Bearer", seen[2][1]["headers"]["Authorization"])
         self.assertIn("email=student%40example.com", seen[2][0])
-        self.assertEqual(seen[4][1]["body"][0], "SET")
+        self.assertEqual(seen[5][1]["body"][0], "SET")
+        self.assertEqual(seen[5][1]["body"][-2:], ["EX", 86400])
 
     def test_context_identity_and_paid_access_are_enforced(self):
         calls = []
         def mismatch(url, **kwargs):
             calls.append(url)
             if url.endswith("/me"):
-                return {"student": {"email": "student@example.com"}}
+                return {"student": {"id": 7, "email": "student@example.com"}}
             if url.endswith("/me/access"):
                 return {"has_access": True}
             return {"email": "other@example.com", "profile": None}
@@ -227,7 +234,7 @@ class CoreTests(unittest.TestCase):
         calls.clear()
         def unpaid(url, **kwargs):
             calls.append(url)
-            return {"student": {"email": "student@example.com"}} if url.endswith("/me") else {"has_access": False}
+            return {"student": {"id": 7, "email": "student@example.com"}} if url.endswith("/me") else {"has_access": False}
         with patch("chatbot.integrations.json_request", side_effect=unpaid):
             with self.assertRaises(ChatError) as caught:
                 CareerApi("https://api.example", "service-token").context("session")
@@ -249,16 +256,28 @@ class ServiceTests(unittest.TestCase):
         return self.service.prepare(cookie, {"conversation_id": self.cid, "message": message,
                                              "history": history or []})
 
-    def test_first_message_and_fixed_context(self):
+    HISTORY = [{"role": "user", "content": "What does an architect do?"},
+               {"role": "assistant", "content": "A useful answer."}]
+
+    def test_first_message_and_cached_followup(self):
         chunks, sources, searched = self.request()
         self.assertEqual(list(chunks), ["A useful answer."])
         self.assertFalse(searched)
         self.assertEqual(self.api.context_calls, 1)
-        history = [{"role": "user", "content": "What does an architect do?"},
-                   {"role": "assistant", "content": "A useful answer."}]
-        self.request(message="How do I prepare?", history=history)
+        self.request(message="How do I prepare?", history=self.HISTORY)
         self.assertEqual(self.api.context_calls, 1)
-        self.assertEqual(self.api.access_calls, 1)
+        self.assertEqual(self.api.access_calls, 2)
+
+    def test_one_snapshot_per_student_refreshed_by_new_chats(self):
+        self.request()
+        self.api.city = "Mumbai"
+        self.cid = str(uuid.uuid4())
+        self.request()
+        self.assertEqual(self.api.context_calls, 2)
+        self.assertEqual(len(self.cache.values), 1)
+        self.request(message="Follow-up", history=self.HISTORY)
+        self.assertEqual(self.api.context_calls, 2)
+        self.assertIn("Mumbai", self.provider.calls[-1][0])
 
     def test_search_sources_and_no_verification_fallback(self):
         chunks, sources, searched = self.request("Latest NATA exam date?")
@@ -277,13 +296,9 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ChatError, "active plan"):
             self.request(message="Follow-up")
         self.api.access = True
-        key = context_key(config().hmac_secret, "session-a", self.cid)
-        self.cache.values.pop(key)
-        with self.assertRaises(ChatError) as caught:
-            self.request(history=[{"role": "user", "content": "Old"},
-                                  {"role": "assistant", "content": "Answer"}])
-        self.assertEqual(caught.exception.code, "conversation_expired")
-        self.assertEqual(self.api.context_calls, 1)
+        self.cache.values.pop(context_key(config().hmac_secret, "id-session-a"))
+        self.request(message="Follow-up", history=self.HISTORY)
+        self.assertEqual(self.api.context_calls, 2)
 
     def test_users_and_conversations_are_isolated(self):
         self.request(cookie="session-a")
@@ -306,7 +321,7 @@ class ServiceTests(unittest.TestCase):
         request["message"] = "How should I prepare?"
         self.assertEqual(list(service.prepare("session-a", request)[0]), ["A useful answer."])
         self.assertEqual(api.context_calls, 1)
-        self.assertEqual(api.access_calls, 1)
+        self.assertEqual(api.access_calls, 2)
         provider.calls.clear()
         request["message"] = "What is the latest exam date?"
         chunks, sources, searched = service.prepare("session-a", request)

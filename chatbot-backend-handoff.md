@@ -50,11 +50,11 @@ Use Python 3.12+ and its standard library HTTP server with modules for request v
 
 1. Validate the request, allowed Origin, cookie, conversation ID, message, and history.
 2. Derive a cache key from an HMAC of the session cookie plus conversation ID. Never store or log the raw cookie. Use a server secret for the HMAC.
-3. On a cache miss with empty history, resolve the student's email through `/me`, check `/me/access`, fetch `/userContext` with the service bearer token, normalise it, and write it to the selected cache. On a cache hit, check login and paid access using `GET /me/access`, then use the cached snapshot. On a cache miss with nonempty history, return `conversation_expired`; the frontend must start a new conversation. Do not silently replace the profile in an existing conversation.
+3. On every message, resolve the student's ID and email through `/me` and check `/me/access`. The cache key is an HMAC of the student ID, so each student has one snapshot. When history is empty (a new chat) or the snapshot is missing, fetch `/userContext` with the service bearer token, normalise it, and write it to the selected cache, replacing any older snapshot. Otherwise use the cached snapshot. Open chats therefore pick up a refreshed profile on their next message.
 4. Build the LLM request from server-owned instructions, the structured profile snapshot, validated recent turns, the new message, and any retrieved web evidence. Profile values and web content are data, not instructions.
 5. Stream the answer. Send source metadata only for URLs actually returned by the search service. End with `done` or `error`.
 
-The cache value contains the normalised profile snapshot and creation time only. It contains no chat messages. Give it a 24-hour sliding inactivity expiry, renewed on successful access. This expiry removes abandoned private data; it does not refresh the profile. Use an atomic first-write operation so simultaneous first requests cannot create conflicting snapshots. When configured, Upstash failures return 503. Without Upstash, the process-local cache is lost on restart and is not shared across workers; deploy a single process and instance in this mode.
+The cache value contains the normalised profile snapshot and creation time only. It contains no chat messages. Give it a 24-hour sliding inactivity expiry, renewed on successful access. This expiry removes abandoned private data; new chats are what refresh the profile. When configured, Upstash failures return 503. Without Upstash, the process-local cache is lost on restart and is not shared across workers; deploy a single process and instance in this mode.
 
 ### Hosted LLM
 
@@ -84,6 +84,6 @@ Pricing references: [Upstash Redis pricing](https://upstash.com/pricing/redis), 
 
 Deliver a runnable backend project with configuration example, API contract, provider and search adapters, Redis client, deployment notes, and meaningful automated tests. No changes to `careerAI` or `careerAPI` are included.
 
-Verify: first-message context fetch; no fetch when opening the chat screen; cache reuse without profile refresh; fixed snapshot after profile edits; access rejection after logout or subscription loss; cache eviction causing `conversation_expired`; isolation between users and conversation IDs; web search and source events; search/provider failures; stream cancellation; rate limits; and attempts to inject instructions through messages, profile text, or web snippets.
+Verify: first-message context fetch; no fetch when opening the chat screen; cache reuse on follow-ups; one snapshot per student, refreshed by each new chat; access rejection after logout or subscription loss; refetch after cache eviction; isolation between users; web search and source events; search/provider failures; stream cancellation; rate limits; and attempts to inject instructions through messages, profile text, or web snippets.
 
 A first version is complete when two authenticated students can chat independently, each receives answers based on their own fixed profile snapshot, current claims are withheld without search or include verifiable sources when search is enabled, and no transcript is persisted by `chatBot`.

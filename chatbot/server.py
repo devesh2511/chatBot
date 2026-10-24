@@ -101,25 +101,21 @@ class ChatService:
                                                     config.llm_api_key, config.omniroute_base_url)
 
     def prepare(self, cookie: str, body: object):
-        conversation_id, message, history = validate_message(body)
-        key = context_key(self.config.hmac_secret, cookie, conversation_id)
+        _, message, history = validate_message(body)
         if self.cache.rate(rate_key(self.config.hmac_secret, cookie, time.time())) > 20:
             raise ChatError(429, "rate_limited", "Too many messages. Please wait a minute.")
-        record = self.cache.get(key)
+        student = self.career_api.student(cookie)
+        self.career_api.check_access(cookie)
+        # One snapshot per student. A new chat (no history) refreshes it from careerAPI;
+        # open chats pick up the refreshed profile on their next message.
+        key = context_key(self.config.hmac_secret, student["id"])
+        record = self.cache.get(key) if history else None
         if record is None:
-            if history:
-                raise ChatError(409, "conversation_expired", "This chat has expired. Start a new chat.")
-            context = normalize_context(self.career_api.context(cookie))
+            context = normalize_context(self.career_api.context_by_email(student["email"]))
             record = {"context": context, "created_at": time.time()}
-            if not self.cache.put_first(key, record):
-                record = self.cache.get(key)
-                if record is None:
-                    raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
-                self.career_api.check_access(cookie)
+            self.cache.put(key, record)
         else:
-            self.career_api.check_access(cookie)
-            if not self.cache.renew(key):
-                raise ChatError(409, "conversation_expired", "This chat has expired. Start a new chat.")
+            self.cache.renew(key)
         context = record.get("context") if isinstance(record, dict) else None
         if not isinstance(context, dict):
             raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")

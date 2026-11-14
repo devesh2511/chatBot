@@ -41,7 +41,7 @@ Return `Content-Type: text/event-stream` from the POST request. Use these event 
 - `done`: JSON `{ "finish_reason": "stop" }` when the answer is complete.
 - `error`: JSON `{ "code": "...", "message": "..." }` if an error occurs after streaming starts.
 
-Before the stream starts, use JSON errors with HTTP 400, 401, 402, 429, 502, or 503 as appropriate. A 429 has code `rate_limited` (more than 20 messages a minute from one session) or `daily_limit_reached` (the student already has 25 completed replies today; resets at midnight IST). The frontend should add a turn to its history only after `done`. It should allow cancelling the request and discard an incomplete assistant turn. The frontend developer owns this behavior.
+Before the stream starts, use JSON errors with HTTP 400, 401, 402, 403, 429, 502, or 503 as appropriate. A 403 with code `profile_incomplete` means a required onboarding answer is empty (`class`, `board`, `medium`, `city`, `marks`, `favourite_subjects`, `hobbies`, `study_location`; `dream_job` and `career_preference` are optional); the error object also carries `missing`, the empty fields in that order. Such a message reaches neither search nor the model, is not counted, and the incomplete snapshot is not cached. A 429 has code `rate_limited` (more than 20 messages a minute from one session) or `daily_limit_reached` (the student already has 25 completed replies today; resets at midnight IST). The frontend should add a turn to its history only after `done`. It should allow cancelling the request and discard an incomplete assistant turn. The frontend developer owns this behavior.
 
 ## 3. Backend architecture and request flow
 

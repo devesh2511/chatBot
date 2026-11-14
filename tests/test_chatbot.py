@@ -9,8 +9,9 @@ from http.server import ThreadingHTTPServer
 from dataclasses import replace
 from unittest.mock import patch
 
-from chatbot.core import (ChatError, context_key, daily_key, get_session_cookie, needs_search,
-                          normalize_context, safe_source, search_query, validate_message)
+from chatbot.core import (REQUIRED_PROFILE_FIELDS, ChatError, context_key, daily_key,
+                          get_session_cookie, needs_search, normalize_context, profile_missing,
+                          safe_source, search_query, validate_message)
 from chatbot.providers import HostedProvider
 from chatbot.server import ChatService, Config, make_handler
 from chatbot.integrations import CareerApi, MemoryCache, TavilySearch, UpstashCache
@@ -24,6 +25,7 @@ class FakeCareerApi:
         self.access_calls = 0
         self.access = True
         self.city = "Pune"
+        self.incomplete = False
 
     def student(self, cookie):
         self.me_calls += 1
@@ -36,7 +38,8 @@ class FakeCareerApi:
         self.context_calls += 1
         return {"student": {"full_name": "Ananya Sharma", "email": "private@example.com",
                             "current_career": "Architect"},
-                "profile": {"class": 10, "city": self.city, "hobbies": ["Drawing"]},
+                "profile": ({"class": 10} if self.incomplete
+                            else {**COMPLETE_PROFILE, "city": self.city, "hobbies": ["Drawing"]}),
                 "latest_quiz": {"riasec_code": "AIC", "results": {
                     "stream_recommendation": "PCM", "top_careers": [
                         {"title": "Architect", "match_pct": 91, "email": "hidden@example.com"}]}}}
@@ -93,6 +96,11 @@ class FakeProvider:
         yield "A useful answer."
 
 
+COMPLETE_PROFILE = {"class": 10, "board": "CBSE", "medium": "English", "city": "Pune",
+                    "marks": {"Maths": 90}, "favourite_subjects": ["Maths"],
+                    "hobbies": ["Coding"], "study_location": "Yes, anywhere"}
+
+
 def config():
     return Config(0, frozenset({"https://app.example"}), "http://api.example/",
                   "service-token", "https://redis.example", "token", "s" * 40, "groq", "test-model",
@@ -138,6 +146,16 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(report["profile_present"])
         self.assertEqual(report["top_careers"][0]["title"], "Aerospace Engineer")
         self.assertNotIn("student@example.com", json.dumps(report))
+
+    def test_profile_missing_rule(self):
+        self.assertEqual(profile_missing({"profile": COMPLETE_PROFILE}), [])
+        optional_empty = {**COMPLETE_PROFILE, "dream_job": None, "career_preference": None}
+        self.assertEqual(profile_missing({"profile": optional_empty}), [])
+        self.assertEqual(profile_missing({"profile": {}}), list(REQUIRED_PROFILE_FIELDS))
+        self.assertEqual(profile_missing({}), list(REQUIRED_PROFILE_FIELDS))
+        gaps = {**COMPLETE_PROFILE, "city": "  ", "marks": {}, "hobbies": []}
+        self.assertEqual(profile_missing({"profile": gaps}), ["city", "marks", "hobbies"])
+        self.assertEqual(len(profile_missing(normalize_context({"profile": None}))), 8)
 
     def test_search_and_sources(self):
         self.assertTrue(needs_search("What is the latest NATA exam date?"))
@@ -346,6 +364,43 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(list(self.request(cookie="session-b")[0]), ["A useful answer."])
         with patch("chatbot.server.time.time", return_value=time.time() + 86400):
             self.assertEqual(list(self.request()[0]), ["A useful answer."])
+
+    def test_incomplete_profile_blocks_without_model_or_cache(self):
+        self.api.incomplete = True
+        with self.assertRaises(ChatError) as caught:
+            self.request()
+        error = caught.exception
+        self.assertEqual((error.status, error.code), (403, "profile_incomplete"))
+        self.assertEqual(error.extra, {"missing": list(REQUIRED_PROFILE_FIELDS[1:])})
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(self.search.calls, [])
+        self.assertEqual(self.cache.values, {})
+        self.assertFalse(any(key.startswith("chat:daily") for key in self.cache.counts))
+
+    def test_completing_profile_unblocks_next_message(self):
+        self.api.incomplete = True
+        with self.assertRaises(ChatError):
+            self.request()
+        self.api.incomplete = False
+        self.assertEqual(list(self.request()[0]), ["A useful answer."])
+        self.assertEqual(self.api.context_calls, 2)
+
+    def test_stale_incomplete_snapshot_is_refetched(self):
+        key = context_key(config().hmac_secret, "session-a")
+        self.cache.values[key] = {"student_id": "id-session-a", "created_at": 0,
+                                  "context": normalize_context({"profile": {"class": 10}})}
+        self.assertEqual(list(self.request()[0]), ["A useful answer."])
+        self.assertEqual(self.api.context_calls, 1)
+        self.assertEqual(profile_missing(self.cache.values[key]["context"]), [])
+
+    def test_http_profile_incomplete_body(self):
+        self.api.incomplete = True
+        seen, text = self.wsgi_call("https://app.example")
+        self.assertEqual(seen["status"], "403 Forbidden")
+        error = json.loads(text)["error"]
+        self.assertEqual(error["code"], "profile_incomplete")
+        self.assertEqual(error["message"], "Complete your profile to start chatting.")
+        self.assertEqual(error["missing"], list(REQUIRED_PROFILE_FIELDS[1:]))
 
     def test_daily_key_rolls_over_at_ist_midnight(self):
         secret = config().hmac_secret
